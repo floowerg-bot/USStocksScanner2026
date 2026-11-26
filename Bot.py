@@ -1,21 +1,48 @@
+
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
+from flask import Flask, request
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً بك في US Stocks Scanner 📈\n"
-        "البوت يعمل بنجاح، وسيتم تجهيز تحليل الأسهم قريباً."
-    )
+app = Flask(__name__)
 
-def main():
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+API = f"https://api.telegram.org/bot{TOKEN}"
 
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
+@app.get("/")
+def home():
+    return "US Stocks Scanner is running!"
 
-    print("Bot is running...")
-    app.run_polling()
+@app.post("/webhook")
+def webhook():
+    update = request.get_json(silent=True) or {}
+    message = update.get("message", {})
+    chat = message.get("chat", {})
+    text = message.get("text", "")
 
-if __name__ == "__main__":
-    main()
+    if chat and text.startswith("/start"):
+        requests.post(
+            f"{API}/sendMessage",
+            json={
+                "chat_id": chat["id"],
+                "text": "Welcome to US Stocks Scanner! 📈\nBot is running successfully."
+            },
+            timeout=15
+        )
+
+    return {"ok": True}
+
+def setup_webhook():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if TOKEN and url:
+        try:
+            response = requests.post(
+                f"{API}/setWebhook",
+                json={"url": f"{url}/webhook"},
+                timeout=15
+            )
+            print("Webhook setup:", response.text)
+        except Exception as error:
+            print("Webhook error:", error)
+
+setup_webhook()
