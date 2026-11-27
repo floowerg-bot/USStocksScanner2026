@@ -1,504 +1,758 @@
 import os
 import json
+import time
 import threading
+import logging
+
 import requests
 import pandas as pd
 import yfinance as yf
 
-from io import StringIO
-from flask import Flask, request
-from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, request, jsonify
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+CHATS_FILE = "chats.json"
+POSITIONS_FILE = "positions.json"
 
 app = Flask(__name__)
 
-# =========================
-# SETTINGS
-# =========================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else None
+SCAN_LOCK = threading.Lock()
 
-CHAT_FILE = "chats.json"
-POSITIONS_FILE = "positions.json"
+# Strategy settings
+EMA_FAST = 20
+EMA_SLOW = 50
+RSI_PERIOD = 14
+ATR_PERIOD = 14
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 USStocksScanner/1.0",
-    "Accept": "application/json, text/html, */*",
-    "Origin": "https://www.nasdaq.com",
-    "Referer": "https://www.nasdaq.com/"
-}
+RESISTANCE_PERIOD = 20
+VOLUME_PERIOD = 20
+
+ATR_STOP_MULTIPLIER = 1.5
+ATR_TARGET_MULTIPLIER = 3.0
+
+MAX_ALERTS = 10
 
 
-# =========================
-# JSON FUNCTIONS
-# =========================
+# ==========================================
+# JSON STORAGE
+# ==========================================
 
 def load_json(filename):
     try:
         with open(filename, "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
 def save_json(filename, data):
     with open(filename, "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=4)
 
 
-# =========================
+# ==========================================
 # TELEGRAM
-# =========================
+# ==========================================
 
 def send_message(chat_id, message):
-
-    if not API:
-        print("ERROR: TELEGRAM_BOT_TOKEN is missing")
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("Telegram token is missing")
         return
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
     try:
         response = requests.post(
-            f"{API}/sendMessage",
+            url,
             json={
                 "chat_id": chat_id,
-                "text": message
+                "text": message,
+                "parse_mode": "HTML"
             },
             timeout=20
         )
 
-        response.raise_for_status()
+        if not response.ok:
+            logger.error("Telegram error: %s", response.text)
 
     except Exception as e:
-        print("Telegram error:", e)
+        logger.error("Telegram send error: %s", e)
 
 
-# =========================
-# NASDAQ-100 TICKERS
-# =========================
+def broadcast(message):
+    chats = load_json(CHATS_FILE)
 
-def get_nasdaq_tickers():
+    for chat_id in chats:
+        send_message(chat_id, message)
 
-    # Try Nasdaq API
+
+# ==========================================
+# NASDAQ 100 SYMBOLS
+# ==========================================
+
+def get_nasdaq_symbols():
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+
     try:
-        url = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
-
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        rows = data.get(
-            "data", {}
-        ).get(
-            "data", {}
-        ).get(
-            "rows", []
-        )
-
-        tickers = [
-            row["symbol"].replace(".", "-")
-            for row in rows
-            if row.get("symbol")
-        ]
-
-        if len(tickers) >= 50:
-            print(f"Loaded {len(tickers)} Nasdaq tickers")
-            return tickers
-
-    except Exception as e:
-        print("Nasdaq API error:", e)
-
-    # Fallback to Wikipedia
-    try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        tables = pd.read_html(
-            StringIO(response.text)
-        )
+        tables = pd.read_html(url)
 
         for table in tables:
-            for col in table.columns:
+            if "Ticker" in table.columns:
+                symbols = table["Ticker"].astype(str).tolist()
 
-                if str(col).lower() in ("ticker", "symbol"):
+                symbols = [
+                    s.replace(".", "-")
+                    for s in symbols
+                    if s and s != "nan"
+                ]
 
-                    tickers = (
-                        table[col]
-                        .dropna()
-                        .astype(str)
-                        .str.replace(".", "-", regex=False)
-                        .tolist()
+                if symbols:
+                    logger.info(
+                        "Loaded %s Nasdaq symbols",
+                        len(symbols)
                     )
-
-                    if len(tickers) >= 50:
-                        print(
-                            f"Loaded {len(tickers)} tickers from Wikipedia"
-                        )
-                        return tickers
+                    return symbols
 
     except Exception as e:
-        print("Wikipedia error:", e)
+        logger.error("Nasdaq list error: %s", e)
 
-    raise RuntimeError(
-        "Could not load Nasdaq-100 constituents"
+    logger.warning("Using fallback Nasdaq list")
+
+    return [
+        "AAPL", "MSFT", "NVDA", "AMZN", "META",
+        "GOOGL", "GOOG", "AVGO", "TSLA", "COST",
+        "NFLX", "AMD", "ADBE", "PEP", "CSCO",
+        "TMUS", "QCOM", "INTU", "AMGN", "TXN",
+        "ISRG", "BKNG", "AMAT", "HON", "VRTX",
+        "PANW", "ADP", "SBUX", "GILD", "ADI"
+    ]
+
+
+# ==========================================
+# TECHNICAL INDICATORS
+# ==========================================
+
+def calculate_indicators(df):
+
+    df = df.copy()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    if not all(col in df.columns for col in required):
+        return None
+
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=required)
+
+    if len(df) < 60:
+        return None
+
+    # EMA
+    df["EMA20"] = df["Close"].ewm(
+        span=EMA_FAST,
+        adjust=False
+    ).mean()
+
+    df["EMA50"] = df["Close"].ewm(
+        span=EMA_SLOW,
+        adjust=False
+    ).mean()
+
+    # RSI
+    delta = df["Close"].diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False,
+        min_periods=RSI_PERIOD
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False,
+        min_periods=RSI_PERIOD
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = df["Close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema26 = df["Close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    df["MACD"] = ema12 - ema26
+
+    df["SIGNAL"] = df["MACD"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    # ATR
+    previous_close = df["Close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - previous_close).abs(),
+            (df["Low"] - previous_close).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    df["ATR"] = tr.ewm(
+        alpha=1 / ATR_PERIOD,
+        adjust=False,
+        min_periods=ATR_PERIOD
+    ).mean()
+
+    # Resistance: highest high of previous 20 sessions
+    # Excludes the current session
+    df["RESISTANCE"] = (
+        df["High"]
+        .shift(1)
+        .rolling(RESISTANCE_PERIOD)
+        .max()
+    )
+
+    # Average volume: previous 20 sessions
+    df["AVG_VOLUME"] = (
+        df["Volume"]
+        .shift(1)
+        .rolling(VOLUME_PERIOD)
+        .mean()
+    )
+
+    return df
+
+
+# ==========================================
+# STOCK ANALYSIS
+# ==========================================
+
+def analyze_stock(symbol):
+
+    try:
+        df = yf.download(
+            symbol,
+            period="6mo",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False
+        )
+
+        if df.empty:
+            return None
+
+        df = calculate_indicators(df)
+
+        if df is None:
+            return None
+
+        row = df.iloc[-1]
+
+        price = float(row["Close"])
+        ema20 = float(row["EMA20"])
+        ema50 = float(row["EMA50"])
+        rsi = float(row["RSI"])
+        macd = float(row["MACD"])
+        signal = float(row["SIGNAL"])
+        atr = float(row["ATR"])
+        resistance = float(row["RESISTANCE"])
+        volume = float(row["Volume"])
+        avg_volume = float(row["AVG_VOLUME"])
+
+        values = [
+            price, ema20, ema50, rsi,
+            macd, signal, atr, resistance,
+            volume, avg_volume
+        ]
+
+        if not all(pd.notna(v) for v in values):
+            return None
+
+        if price <= 0 or atr <= 0 or resistance <= 0:
+            return None
+
+        trend = price > ema20 > ema50
+        momentum = macd > signal
+        rsi_good = 50 <= rsi <= 68
+        volume_confirmed = volume > avg_volume
+
+        # Confirmed resistance breakout
+        breakout = price > resistance * 1.001
+
+        # Strong BUY: all conditions must be met
+        strong_buy = (
+            trend
+            and momentum
+            and rsi_good
+            and volume_confirmed
+            and breakout
+        )
+
+        # Medium opportunity: approaching resistance
+        near_resistance = (
+            resistance * 0.98 <= price <= resistance * 1.001
+        )
+
+        medium_buy = (
+            trend
+            and momentum
+            and 48 <= rsi <= 70
+            and near_resistance
+            and volume >= avg_volume * 0.80
+            and not strong_buy
+        )
+
+        # Dynamic risk management using ATR
+        stop_loss = price - (
+            ATR_STOP_MULTIPLIER * atr
+        )
+
+        take_profit = price + (
+            ATR_TARGET_MULTIPLIER * atr
+        )
+
+        return {
+            "symbol": symbol,
+            "price": price,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi": rsi,
+            "macd": macd,
+            "signal": signal,
+            "atr": atr,
+            "resistance": resistance,
+            "volume": volume,
+            "avg_volume": avg_volume,
+            "breakout": breakout,
+            "strong_buy": strong_buy,
+            "medium_buy": medium_buy,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit
+        }
+
+    except Exception as e:
+        logger.warning(
+            "Analysis failed for %s: %s",
+            symbol, e
+        )
+        return None
+
+
+# ==========================================
+# BUY ALERT
+# ==========================================
+
+def create_buy_message(data):
+
+    symbol = data["symbol"]
+
+    return (
+        f"🟢 <b>STRONG BUY - {symbol}</b>\n\n"
+        f"💰 Entry: ${data['price']:.2f}\n"
+        f"🎯 Target: ${data['take_profit']:.2f}\n"
+        f"🛑 Stop Loss: ${data['stop_loss']:.2f}\n\n"
+        f"📊 RSI: {data['rsi']:.1f}\n"
+        f"📈 EMA20: ${data['ema20']:.2f}\n"
+        f"📈 EMA50: ${data['ema50']:.2f}\n"
+        f"📉 MACD: Bullish\n"
+        f"📦 Volume: Confirmed\n\n"
+        f"🚀 Resistance Breakout Confirmed\n"
+        f"📐 ATR: ${data['atr']:.2f}\n"
+        f"⚖️ Risk/Reward: 1:2\n\n"
+        f"⏱ Strategy: Swing Trading\n"
+        f"📅 Timeframe: Daily"
     )
 
 
-# =========================
-# MARKET SCANNER
-# =========================
+# ==========================================
+# MEDIUM OPPORTUNITY ALERT
+# ==========================================
 
-def scan_market(chat_id):
+def create_medium_message(data):
+
+    return (
+        f"🟡 <b>MEDIUM OPPORTUNITY - "
+        f"{data['symbol']}</b>\n\n"
+        f"💰 Current Price: ${data['price']:.2f}\n"
+        f"🎯 Resistance: ${data['resistance']:.2f}\n"
+        f"📊 RSI: {data['rsi']:.1f}\n"
+        f"📈 Trend: Bullish\n"
+        f"📉 MACD: Bullish\n\n"
+        f"⚠️ Waiting for resistance breakout.\n"
+        f"👀 Add to watchlist.\n"
+        f"❌ No BUY confirmation yet."
+    )
+
+
+# ==========================================
+# SELL MANAGEMENT
+# ==========================================
+
+def check_open_positions(data, positions):
+
+    symbol = data["symbol"]
+
+    if symbol not in positions:
+        return False
+
+    position = positions[symbol]
+
+    if not isinstance(position, dict):
+        return False
+
+    entry = float(position.get("entry", 0))
+    stop = float(position.get("stop_loss", 0))
+    target = float(position.get("take_profit", 0))
+
+    price = data["price"]
+
+    reason = None
+
+    if stop and price <= stop:
+        reason = "Stop Loss reached"
+
+    elif target and price >= target:
+        reason = "Take Profit reached"
+
+    elif price < data["ema20"]:
+        reason = "Price below EMA20"
+
+    elif data["macd"] < data["signal"]:
+        reason = "MACD bearish crossover"
+
+    elif data["rsi"] < 40:
+        reason = "RSI below 40"
+
+    if reason:
+
+        profit_pct = (
+            ((price - entry) / entry) * 100
+            if entry > 0 else 0
+        )
+
+        message = (
+            f"🔴 <b>SELL ALERT - {symbol}</b>\n\n"
+            f"💰 Entry: ${entry:.2f}\n"
+            f"📉 Current Price: ${price:.2f}\n"
+            f"📊 Return: {profit_pct:+.2f}%\n\n"
+            f"⚠️ Reason: {reason}"
+        )
+
+        broadcast(message)
+
+        del positions[symbol]
+        save_json(POSITIONS_FILE, positions)
+
+        return True
+
+    return False
+
+
+# ==========================================
+# MARKET SCANNER
+# ==========================================
+
+def scan_market():
+
+    if not SCAN_LOCK.acquire(blocking=False):
+        return "A scan is already running."
 
     try:
-        tickers = get_nasdaq_tickers()
 
-        buys = []
-        sells = []
+        logger.info("Starting Nasdaq-100 scan")
+
+        symbols = get_nasdaq_symbols()
 
         positions = load_json(POSITIONS_FILE)
 
-        for ticker in tickers:
+        strong_signals = []
+        medium_signals = []
 
-            try:
-                hist = yf.Ticker(ticker).history(
-                    period="6mo",
-                    interval="1d",
-                    timeout=20
-                )
+        scanned = 0
 
-                if hist.empty or len(hist) < 60:
-                    continue
+        for symbol in symbols:
 
-                close = hist["Close"].dropna()
-                volume = hist["Volume"]
+            data = analyze_stock(symbol)
 
-                if len(close) < 60:
-                    continue
-
-                # EMA 20 / 50
-                ema20 = close.ewm(
-                    span=20,
-                    adjust=False
-                ).mean()
-
-                ema50 = close.ewm(
-                    span=50,
-                    adjust=False
-                ).mean()
-
-                # RSI 14
-                delta = close.diff()
-
-                gain = delta.clip(
-                    lower=0
-                ).ewm(
-                    alpha=1/14,
-                    adjust=False
-                ).mean()
-
-                loss = (-delta.clip(
-                    upper=0
-                )).ewm(
-                    alpha=1/14,
-                    adjust=False
-                ).mean()
-
-                rs = gain / loss.replace(
-                    0, float("nan")
-                )
-
-                rsi = 100 - (100 / (1 + rs))
-
-                # MACD
-                macd = (
-                    close.ewm(
-                        span=12,
-                        adjust=False
-                    ).mean()
-                    -
-                    close.ewm(
-                        span=26,
-                        adjust=False
-                    ).mean()
-                )
-
-                signal = macd.ewm(
-                    span=9,
-                    adjust=False
-                ).mean()
-
-                # Current values
-                price = float(close.iloc[-1])
-                current_rsi = float(rsi.iloc[-1])
-
-                current_ema20 = float(ema20.iloc[-1])
-                current_ema50 = float(ema50.iloc[-1])
-
-                current_macd = float(macd.iloc[-1])
-                current_signal = float(signal.iloc[-1])
-
-                current_volume = float(volume.iloc[-1])
-
-                average_volume = float(
-                    volume.rolling(20).mean().iloc[-1]
-                )
-
-                values = [
-                    price,
-                    current_rsi,
-                    current_ema20,
-                    current_ema50,
-                    current_macd,
-                    current_signal,
-                    current_volume,
-                    average_volume
-                ]
-
-                if not all(
-                    pd.notna(x) for x in values
-                ):
-                    continue
-
-                # BUY conditions
-                buy = (
-                    price > current_ema20 > current_ema50
-                    and 50 < current_rsi < 68
-                    and current_macd > current_signal
-                    and current_volume > average_volume
-                )
-
-                # SELL conditions
-                sell = (
-                    price < current_ema20
-                    or current_macd < current_signal
-                    or current_rsi < 40
-                )
-
-                # BUY signal
-                if buy and ticker not in positions:
-
-                    stop = price * 0.95
-                    target = price * 1.10
-
-                    buys.append(
-                        f"🟢 BUY: {ticker}\n"
-                        f"السعر: ${price:.2f}\n"
-                        f"الهدف: ${target:.2f}\n"
-                        f"وقف الخسارة: ${stop:.2f}\n"
-                        f"RSI: {current_rsi:.1f}"
-                    )
-
-                    positions.append(ticker)
-
-                # SELL signal
-                elif sell and ticker in positions:
-
-                    sells.append(
-                        f"🔴 SELL: {ticker}\n"
-                        f"السعر: ${price:.2f}\n"
-                        f"RSI: {current_rsi:.1f}"
-                    )
-
-                    positions.remove(ticker)
-
-            except Exception as e:
-                print(f"{ticker} error: {e}")
+            if data is None:
                 continue
 
-        save_json(POSITIONS_FILE, positions)
+            scanned += 1
 
-        results = buys + sells
+            # Manage existing positions first
+            if check_open_positions(data, positions):
+                continue
 
-        if results:
+            # Do not create duplicate positions
+            if symbol in positions:
+                continue
 
-            message = (
-                "📊 Nasdaq-100 Swing Scanner\n\n"
-                + "\n\n".join(results[:10])
+            if data["strong_buy"]:
+                strong_signals.append(data)
+
+            elif data["medium_buy"]:
+                medium_signals.append(data)
+
+            # Small delay between downloads
+            time.sleep(0.15)
+
+        # Send strong BUY signals
+        for data in strong_signals[:MAX_ALERTS]:
+
+            symbol = data["symbol"]
+
+            positions[symbol] = {
+                "entry": data["price"],
+                "stop_loss": data["stop_loss"],
+                "take_profit": data["take_profit"],
+                "date": pd.Timestamp.now().isoformat()
+            }
+
+            save_json(POSITIONS_FILE, positions)
+
+            broadcast(create_buy_message(data))
+
+        # Send medium opportunities
+        remaining = max(
+            0,
+            MAX_ALERTS - len(strong_signals[:MAX_ALERTS])
+        )
+
+        for data in medium_signals[:remaining]:
+            broadcast(create_medium_message(data))
+
+        # Summary
+        summary = (
+            "📊 <b>Nasdaq-100 Scan Completed</b>\n\n"
+            f"🔍 Stocks analyzed: {scanned}\n"
+            f"🟢 Strong BUY: {len(strong_signals)}\n"
+            f"🟡 Medium: {len(medium_signals)}\n"
+            f"🔴 Existing positions: {len(positions)}\n\n"
+        )
+
+        if not strong_signals and not medium_signals:
+            summary += (
+                "No BUY or MEDIUM opportunities "
+                "matched the strategy."
             )
+
+        elif strong_signals:
+            summary += "Strong BUY opportunities detected."
 
         else:
-
-            message = (
-                "📊 انتهى الفحص.\n"
-                "لم تظهر إشارات شراء أو بيع مطابقة للشروط."
+            summary += (
+                "No confirmed BUY signals. "
+                "Medium opportunities are being monitored."
             )
 
-        send_message(chat_id, message)
+        broadcast(summary)
 
-        print(
-            f"Scan completed: "
-            f"Buys={len(buys)}, Sells={len(sells)}"
-        )
+        logger.info("Scan completed")
+
+        return summary
 
     except Exception as e:
 
-        print("Scanner error:", e)
+        logger.exception("Market scan failed")
 
-        send_message(
-            chat_id,
-            "حدث خطأ أثناء فحص السوق. حاول لاحقاً."
+        broadcast(
+            "⚠️ Error occurred during market scan. "
+            "Please try again later."
         )
 
+        return str(e)
 
-# =========================
-# AUTOMATIC DAILY SCAN
-# =========================
-
-def scheduled_scan():
-
-    chats = load_json(CHAT_FILE)
-
-    print("Starting automatic Nasdaq scan...")
-
-    if not chats:
-        print("No registered Telegram users")
-        return
-
-    for chat_id in chats:
-
-        threading.Thread(
-            target=scan_market,
-            args=(chat_id,),
-            daemon=True
-        ).start()
+    finally:
+        SCAN_LOCK.release()
 
 
-# =========================
-# SCHEDULER
-# =========================
+# ==========================================
+# TELEGRAM COMMANDS
+# ==========================================
 
-scheduler = BackgroundScheduler(
-    timezone="America/New_York"
-)
-
-scheduler.add_job(
-    scheduled_scan,
-    trigger="cron",
-    day_of_week="mon-fri",
-    hour=16,
-    minute=30,
-    id="daily_market_scan",
-    replace_existing=True,
-    max_instances=1,
-    coalesce=True,
-    misfire_grace_time=3600
-)
-
-scheduler.start()
-
-print(
-    "Daily Nasdaq scanner scheduled "
-    "for 4:30 PM New York time"
-)
-
-
-# =========================
-# WEB ROUTES
-# =========================
-
-@app.get("/")
-def home():
-    return "US Stocks Scanner is running!"
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/webhook")
-def webhook():
-
-    update = request.get_json(silent=True) or {}
+def process_update(update):
 
     message = update.get("message", {})
 
     if not message:
-        return {"ok": True}
+        return
 
-    chat_id = message.get(
-        "chat", {}
-    ).get("id")
+    chat_id = str(message["chat"]["id"])
 
-    command = message.get(
-        "text", ""
-    ).strip()
+    text = message.get("text", "").strip()
 
-    if not chat_id:
-        return {"ok": True}
+    chats = load_json(CHATS_FILE)
 
-    if command.startswith("/start"):
+    if text.startswith("/start"):
 
-        chats = load_json(CHAT_FILE)
+        chats[chat_id] = True
+        save_json(CHATS_FILE, chats)
+
+        send_message(
+            chat_id,
+            "👋 Welcome to Nasdaq-100 Swing Scanner V2!\n\n"
+            "📊 Market: Nasdaq-100\n"
+            "⏱ Strategy: Swing Trading\n"
+            "🟢 Strong BUY alerts\n"
+            "🟡 Medium opportunities\n"
+            "🔴 SELL alerts\n\n"
+            "Commands:\n"
+            "/scan - Start market scan\n"
+            "/status - Bot status"
+        )
+
+    elif text.startswith("/scan"):
 
         if chat_id not in chats:
-            chats.append(chat_id)
-            save_json(CHAT_FILE, chats)
+            chats[chat_id] = True
+            save_json(CHATS_FILE, chats)
 
         send_message(
             chat_id,
-            "أهلاً بك في US Stocks Scanner 📈\n\n"
-            "الأوامر:\n"
-            "/scan - فحص أسهم Nasdaq-100\n"
-            "/start - القائمة الرئيسية"
+            "🔎 Starting Nasdaq-100 scan...\n"
+            "Please wait for the results."
         )
 
-    elif command.startswith("/scan"):
-
-        send_message(
-            chat_id,
-            "🔎 بدأ فحص Nasdaq-100، انتظر النتائج..."
-        )
-
-        threading.Thread(
+        thread = threading.Thread(
             target=scan_market,
-            args=(chat_id,),
             daemon=True
-        ).start()
+        )
 
-    return {"ok": True}
+        thread.start()
+
+    elif text.startswith("/status"):
+
+        send_message(
+            chat_id,
+            "🟢 Bot is running.\n"
+            "📊 Nasdaq-100\n"
+            "⏱ Swing Trading\n"
+            "📅 Daily timeframe\n"
+            "Version: V2"
+        )
 
 
-# =========================
-# TELEGRAM WEBHOOK
-# =========================
+# ==========================================
+# FLASK WEBHOOK
+# ==========================================
+
+@app.route("/", methods=["GET"])
+def home():
+
+    return "Nasdaq-100 Swing Scanner V2 is running."
+
+
+@app.route("/health", methods=["GET"])
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "version": "V2"
+    })
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+
+    try:
+
+        update = request.get_json(silent=True)
+
+        if update:
+            process_update(update)
+
+        return jsonify({"ok": True})
+
+    except Exception as e:
+
+        logger.exception("Webhook error")
+
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
+
+
+# ==========================================
+# TELEGRAM WEBHOOK SETUP
+# ==========================================
 
 def setup_webhook():
 
-    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("Telegram token missing")
+        return
 
-    if TOKEN and url:
+    if not RENDER_EXTERNAL_URL:
+        logger.warning("Render URL missing")
+        return
 
-        try:
-            response = requests.post(
-                f"{API}/setWebhook",
-                json={
-                    "url": f"{url}/webhook"
-                },
-                timeout=15
-            )
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    )
 
-            print(
-                "Webhook setup:",
-                response.text
-            )
+    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
 
-        except Exception as error:
-            print("Webhook error:", error)
+    try:
 
+        response = requests.post(
+            url,
+            json={"url": webhook_url},
+            timeout=20
+        )
+
+        logger.info(
+            "Webhook setup response: %s",
+            response.text
+        )
+
+    except Exception as e:
+
+        logger.error("Webhook setup failed: %s", e)
+
+
+# ==========================================
+# STARTUP
+# ==========================================
 
 setup_webhook()
+
+
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
