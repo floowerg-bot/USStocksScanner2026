@@ -3,6 +3,7 @@ import json
 import html
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -24,19 +25,27 @@ CHAT_FILE = "chats.json"
 POSITIONS_FILE = "positions.json"
 SHARIA_CACHE_FILE = "sharia_cache.json"
 WATCHLIST_FILE = "watchlist.json"
+WATCH_STATE_FILE = "watch_alert_state.json"
+WATCH_SCHEDULE_FILE = "watch_schedule.json"
 
 MIZAN_URL = "https://askmizan.com/api/v1/screen/{}"
 
 MAX_ALERTS = 10
 SHARIA_CACHE_HOURS = 24
 
+WATCH_SCAN_HOUR = 16
+WATCH_SCAN_MINUTE = 15
+
 scan_lock = threading.Lock()
+scheduler_started = False
 
 chat_ids = []
 positions = {}
 sharia_cache = {}
 watchlists = {}
 latest_results = {}
+watch_alert_state = {}
+watch_schedule = {}
 
 
 # =========================
@@ -63,6 +72,8 @@ chat_ids = load_json(CHAT_FILE, [])
 positions = load_json(POSITIONS_FILE, {})
 sharia_cache = load_json(SHARIA_CACHE_FILE, {})
 watchlists = load_json(WATCHLIST_FILE, {})
+watch_alert_state = load_json(WATCH_STATE_FILE, {})
+watch_schedule = load_json(WATCH_SCHEDULE_FILE, {})
 
 
 # =========================
@@ -484,8 +495,6 @@ def analyze_stock(symbol):
         score = 0
         details = {}
 
-        # الاتجاه
-
         if price > e20 and e20 > e50:
             score += 25
             details["trend"] = 25
@@ -497,15 +506,11 @@ def analyze_stock(symbol):
         else:
             details["trend"] = 0
 
-        # MACD
-
         if current_macd > current_signal:
             score += 20
             details["macd"] = 20
         else:
             details["macd"] = 0
-
-        # RSI
 
         if 50 <= current_rsi <= 68:
             score += 15
@@ -521,8 +526,6 @@ def analyze_stock(symbol):
         else:
             details["rsi"] = 0
 
-        # Volume
-
         if volume_ratio >= 1:
             score += 20
             details["volume"] = 20
@@ -533,8 +536,6 @@ def analyze_stock(symbol):
 
         else:
             details["volume"] = 0
-
-        # Breakout
 
         if price > resistance:
             score += 20
@@ -606,6 +607,27 @@ def recommendation_keyboard(symbol):
                 {
                     "text": "⭐ إضافة للمراقبة",
                     "callback_data": f"watch:{symbol}"
+                }
+            ]
+        ]
+    }
+
+
+def watch_alert_keyboard(symbol):
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "📊 تفاصيل السهم",
+                    "callback_data": f"details:{symbol}"
+                },
+                {
+                    "text": "📈 الرسم البياني",
+                    "url": (
+                        "https://www.tradingview.com/symbols/"
+                        f"{symbol}/"
+                    )
                 }
             ]
         ]
@@ -776,7 +798,267 @@ def send_watchlist(chat_id):
     for symbol in items:
         message += f"• {html.escape(symbol)}\n"
 
+    message += (
+        "\n🔔 تتم مراقبة الأسهم تلقائياً بعد إغلاق السوق "
+        "الأمريكي في أيام التداول."
+    )
+
     send_message(chat_id, message, parse_mode="HTML")
+
+
+# =========================
+# التنبيهات التلقائية لقائمة المراقبة
+# =========================
+
+def send_watch_entry_alert(chat_id, item):
+
+    symbol = item["symbol"]
+    price = item["price"]
+
+    message = (
+        "🔔 <b>تنبيه دخول من قائمة المراقبة</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📌 <b>السهم:</b> {html.escape(symbol)}\n"
+        f"💵 <b>السعر:</b> ${price:.2f}\n"
+        f"📊 <b>التقييم:</b> {item['score']}/100\n"
+        f"📈 <b>RSI:</b> {item['rsi']:.1f}\n"
+        f"📉 <b>EMA20:</b> ${item['ema20']:.2f}\n"
+        f"📉 <b>EMA50:</b> ${item['ema50']:.2f}\n"
+        f"📈 <b>MACD:</b> {item['macd']:.4f}\n"
+        f"📦 <b>Volume:</b> {item['volume_ratio']:.2f}x\n"
+        f"🕌 <b>AAOIFI:</b> {sharia_label(item['sharia'])}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🟢 <b>الإشارة الفنية:</b> {item['signal']}\n"
+        f"📌 <b>قرار RSI:</b> {html.escape(item['rsi_label'])}\n"
+        "\n"
+        "🎯 الهدف النظري: "
+        f"${price * 1.10:.2f}\n"
+        "🛑 وقف الخسارة النظري: "
+        f"${price * 0.95:.2f}\n"
+        "\n"
+        "<i>هذا تنبيه فني للمتابعة وليس أمراً بالشراء "
+        "أو ضماناً للربح.</i>"
+    )
+
+    send_message(
+        chat_id,
+        message,
+        reply_markup=watch_alert_keyboard(symbol),
+        parse_mode="HTML"
+    )
+
+
+def check_watchlist_alerts():
+
+    if not scan_lock.acquire(blocking=False):
+        logger.info(
+            "Watchlist check skipped because another scan is running."
+        )
+        return False
+
+    try:
+
+        # تجميع الأسهم من قوائم جميع المستخدمين
+
+        all_symbols = set()
+
+        for items in watchlists.values():
+            for symbol in items:
+                all_symbols.add(symbol.upper())
+
+        if not all_symbols:
+            logger.info("No watchlist symbols to scan.")
+            return True
+
+        logger.info(
+            "Starting automatic watchlist scan: %s",
+            sorted(all_symbols)
+        )
+
+        analysis_results = {}
+
+        # تحليل كل سهم مرة واحدة
+
+        for symbol in sorted(all_symbols):
+
+            result = analyze_stock(symbol)
+
+            if result is None:
+                logger.warning(
+                    "Watchlist analysis failed for %s",
+                    symbol
+                )
+                continue
+
+            result["sharia"] = check_sharia(symbol)
+            analysis_results[symbol] = result
+
+        now_text = datetime.now(
+            ZoneInfo("America/New_York")
+        ).isoformat()
+
+        # فحص حالة كل سهم لكل مستخدم
+
+        for chat_id, items in list(watchlists.items()):
+
+            for symbol in items:
+
+                symbol = symbol.upper()
+                result = analysis_results.get(symbol)
+
+                if result is None:
+                    continue
+
+                state_key = f"{chat_id}:{symbol}"
+
+                previous = watch_alert_state.get(
+                    state_key,
+                    {}
+                )
+
+                was_entry_allowed = previous.get(
+                    "entry_allowed",
+                    False
+                )
+
+                # السماح بالتنبيه فقط إذا:
+                # 1- السهم شرعي
+                # 2- الإشارة Strong BUY أو Medium
+                # 3- RSI يسمح بالدخول
+
+                is_eligible = (
+                    result["sharia"] == "HALAL"
+                    and result["signal"] in (
+                        "STRONG BUY",
+                        "MEDIUM"
+                    )
+                    and result["entry_allowed"]
+                )
+
+                # تنبيه عند الانتقال من الانتظار إلى الدخول
+
+                if is_eligible and not was_entry_allowed:
+
+                    send_watch_entry_alert(
+                        chat_id,
+                        result
+                    )
+
+                    logger.info(
+                        "Watchlist entry alert sent: %s to %s",
+                        symbol,
+                        chat_id
+                    )
+
+                # حفظ الحالة الحالية لمنع تكرار التنبيه
+
+                watch_alert_state[state_key] = {
+                    "entry_allowed": bool(is_eligible),
+                    "rsi_status": result["rsi_status"],
+                    "signal": result["signal"],
+                    "sharia": result["sharia"],
+                    "last_rsi": result["rsi"],
+                    "last_checked": now_text
+                }
+
+        save_json(WATCH_STATE_FILE, watch_alert_state)
+
+        logger.info("Automatic watchlist scan completed.")
+
+        return True
+
+    except Exception:
+        logger.exception("Watchlist scan error")
+        return False
+
+    finally:
+        scan_lock.release()
+
+
+# =========================
+# مجدول الفحص اليومي
+# =========================
+
+def watchlist_scheduler():
+
+    logger.info("Automatic watchlist scheduler started.")
+
+    new_york = ZoneInfo("America/New_York")
+
+    while True:
+
+        try:
+
+            now = datetime.now(new_york)
+            today = now.strftime("%Y-%m-%d")
+
+            is_weekday = now.weekday() < 5
+
+            scheduled_time_reached = (
+                now.hour > WATCH_SCAN_HOUR
+                or (
+                    now.hour == WATCH_SCAN_HOUR
+                    and now.minute >= WATCH_SCAN_MINUTE
+                )
+            )
+
+            last_run_date = watch_schedule.get(
+                "last_run_date"
+            )
+
+            if (
+                is_weekday
+                and scheduled_time_reached
+                and last_run_date != today
+            ):
+
+                logger.info(
+                    "Daily watchlist scan is due: %s",
+                    today
+                )
+
+                completed = check_watchlist_alerts()
+
+                if completed:
+
+                    watch_schedule["last_run_date"] = today
+
+                    save_json(
+                        WATCH_SCHEDULE_FILE,
+                        watch_schedule
+                    )
+
+                    logger.info(
+                        "Daily watchlist scan date saved: %s",
+                        today
+                    )
+
+        except Exception:
+            logger.exception("Scheduler error")
+
+        # إعادة التحقق كل دقيقة
+
+        time.sleep(60)
+
+
+def start_watchlist_scheduler():
+
+    global scheduler_started
+
+    if scheduler_started:
+        return
+
+    scheduler_started = True
+
+    thread = threading.Thread(
+        target=watchlist_scheduler,
+        daemon=True,
+        name="WatchlistScheduler"
+    )
+
+    thread.start()
+
+    logger.info("Watchlist scheduler thread launched.")
 
 
 # =========================
@@ -861,7 +1143,7 @@ def scan_market():
     global latest_results
 
     if not scan_lock.acquire(blocking=False):
-        return "⏳ يوجد فحص آخر قيد التنفيذ."
+        return "⏳ يوجد فحص آخر قيد التنفيذ.", []
 
     try:
 
@@ -897,8 +1179,6 @@ def scan_market():
 
         latest_results = analysis_results.copy()
 
-        # تنبيهات البيع
-
         sell_messages = check_open_positions(analysis_results)
 
         for message in sell_messages:
@@ -915,8 +1195,6 @@ def scan_market():
         ]
 
         candidates = strong + medium
-
-        # فحص الشرعية للمرشحين فقط
 
         for item in candidates:
             item["sharia"] = check_sharia(item["symbol"])
@@ -965,8 +1243,6 @@ def scan_market():
             x for x in eligible_strong + eligible_medium
             if x["rsi_status"] == "CAUTION"
         ]
-
-        # تسجيل الصفقات الافتراضية المسموح بها فقط
 
         for item in eligible_strong:
 
@@ -1019,8 +1295,6 @@ def scan_market():
             f"Volume: {diagnostics['volume']}\n"
             f"Breakout: {diagnostics['breakout']}\n"
         )
-
-        # تجهيز البطاقات
 
         all_eligible = eligible_strong + eligible_medium
 
@@ -1093,7 +1367,8 @@ def handle_start(chat_id):
         "📈 الاستراتيجية: Swing Trading\n"
         "🕌 الفحص الشرعي: AAOIFI عبر Mizan\n"
         "🎯 فلتر RSI: V6\n"
-        "🔔 التنبيهات: BUY & SELL\n\n"
+        "🔔 التنبيهات: BUY & SELL\n"
+        "⭐ مراقبة تلقائية للأسهم المضافة\n\n"
         "الأوامر:\n"
         "/scan - فحص السوق\n"
         "/status - حالة البوت\n"
@@ -1111,6 +1386,8 @@ def handle_status(chat_id):
         f"🕌 Sharia standard: AAOIFI\n"
         f"📊 Cached Sharia results: {len(sharia_cache)}\n"
         f"⭐ Watchlist: {len(get_watchlist(chat_id))}\n"
+        "🔔 Automatic watchlist alerts: ON\n"
+        "🕓 Watchlist scan: 4:15 PM New York time, weekdays\n"
     )
 
     if positions:
@@ -1156,8 +1433,6 @@ def handle_scan(chat_id):
 def handle_update(update):
 
     try:
-
-        # ضغط الأزرار
 
         callback = update.get("callback_query")
 
@@ -1211,7 +1486,7 @@ def handle_update(update):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Nasdaq-100 Swing Scanner V6 is running."
+    return "Nasdaq-100 Swing Scanner V7 is running."
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1260,3 +1535,4 @@ def setup_webhook():
 
 
 setup_webhook()
+start_watchlist_scheduler()
