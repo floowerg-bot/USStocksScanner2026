@@ -2,17 +2,13 @@ import os
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
 import yfinance as yf
 from flask import Flask, request
-
-# =========================
-# إعدادات عامة
-# =========================
 
 app = Flask(__name__)
 
@@ -21,41 +17,48 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 CHAT_FILE = "chats.json"
 POSITIONS_FILE = "positions.json"
+SHARIA_CACHE_FILE = "sharia_cache.json"
+
+MIZAN_URL = "https://askmizan.com/api/v1/screen/{}"
 
 MAX_ALERTS = 10
+SHARIA_CACHE_HOURS = 24
 
 scan_lock = threading.Lock()
 
+chat_ids = []
+positions = {}
+sharia_cache = {}
+
+
 # =========================
-# تخزين البيانات
+# التخزين
 # =========================
 
 def load_json(filename, default):
     try:
-        with open(filename, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
-    except Exception as error:
-        logger.error("File loading error %s: %s", filename, error)
+        with open(filename, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
         return default
 
 
 def save_json(filename, data):
     try:
-        with open(filename, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=4)
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as error:
-        logger.error("File saving error %s: %s", filename, error)
+        logger.error("Save error: %s", error)
 
 
 chat_ids = load_json(CHAT_FILE, [])
 positions = load_json(POSITIONS_FILE, {})
+sharia_cache = load_json(SHARIA_CACHE_FILE, {})
+
 
 # =========================
 # Telegram
@@ -63,26 +66,20 @@ positions = load_json(POSITIONS_FILE, {})
 
 def send_message(chat_id, message):
     if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN is missing")
+        logger.error("Missing TELEGRAM_BOT_TOKEN")
         return
 
-    url = f"{TELEGRAM_API}/sendMessage"
-
     try:
-        response = requests.post(
-            url,
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": message
             },
             timeout=20
         )
-
-        if not response.ok:
-            logger.error("Telegram error: %s", response.text)
-
     except Exception as error:
-        logger.error("Telegram send error: %s", error)
+        logger.error("Telegram error: %s", error)
 
 
 def broadcast(message):
@@ -99,7 +96,114 @@ def register_chat(chat_id):
 
 
 # =========================
-# قائمة Nasdaq-100
+# فحص شرعية السهم - Mizan
+# =========================
+
+def check_sharia(symbol):
+    """
+    يعتمد على نتيجة AAOIFI فقط.
+    إذا لم تتوفر نتيجة واضحة يرجع UNKNOWN.
+    """
+
+    now = datetime.now(timezone.utc).timestamp()
+
+    cached = sharia_cache.get(symbol)
+
+    if cached:
+        try:
+            age_hours = (
+                now - float(cached["timestamp"])
+            ) / 3600
+
+            if (
+                age_hours < SHARIA_CACHE_HOURS
+                and cached["status"] in ("HALAL", "HARAM")
+            ):
+                return cached["status"]
+
+        except Exception:
+            pass
+
+    try:
+        response = requests.get(
+            MIZAN_URL.format(symbol),
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        status = None
+
+        # الطريقة الأولى: البحث داخل screens
+
+        screens = data.get("screens", [])
+
+        for screen in screens:
+            standard = str(
+                screen.get("standard", "")
+            ).upper()
+
+            if standard == "AAOIFI":
+                compliant = screen.get("compliant")
+
+                if compliant is True:
+                    status = "HALAL"
+                elif compliant is False:
+                    status = "HARAM"
+
+                break
+
+        # الطريقة الثانية: by_standard
+
+        if status is None:
+            by_standard = data.get("by_standard", {})
+            result = str(
+                by_standard.get("AAOIFI", "")
+            ).lower()
+
+            if result in ("pass", "compliant"):
+                status = "HALAL"
+
+            elif result in ("fail", "non-compliant"):
+                status = "HARAM"
+
+        # لا نعتمد على التخمين
+
+        if status not in ("HALAL", "HARAM"):
+            return "UNKNOWN"
+
+        sharia_cache[symbol] = {
+            "status": status,
+            "timestamp": now
+        }
+
+        save_json(SHARIA_CACHE_FILE, sharia_cache)
+
+        return status
+
+    except Exception as error:
+        logger.warning(
+            "Sharia check failed for %s: %s",
+            symbol,
+            error
+        )
+        return "UNKNOWN"
+
+
+def sharia_label(status):
+    if status == "HALAL":
+        return "🟢 شرعي"
+
+    if status == "HARAM":
+        return "🔴 غير شرعي"
+
+    return "🟡 غير محسوم"
+
+
+# =========================
+# Nasdaq-100
 # =========================
 
 def get_nasdaq_symbols():
@@ -129,36 +233,21 @@ def get_nasdaq_symbols():
         if not rows and isinstance(data.get("data"), dict):
             rows = data["data"].get("rows", [])
 
-        symbols = []
-
-        for row in rows:
-            symbol = row.get("symbol")
-
-            if symbol:
-                symbols.append(
-                    symbol.strip().replace(".", "-")
-                )
+        symbols = [
+            row["symbol"].strip().replace(".", "-")
+            for row in rows
+            if row.get("symbol")
+        ]
 
         symbols = sorted(set(symbols))
 
         if len(symbols) >= 90:
-            logger.info(
-                "Successfully loaded %s Nasdaq-100 symbols",
-                len(symbols)
-            )
             return symbols
 
-        logger.warning(
-            "Nasdaq API returned only %s symbols",
-            len(symbols)
-        )
-
     except Exception as error:
-        logger.error("Nasdaq list error: %s", error)
+        logger.error("Nasdaq API error: %s", error)
 
-    # قائمة احتياطية في حال تعطل مصدر Nasdaq
-
-    fallback_symbols = [
+    return [
         "AAPL", "MSFT", "NVDA", "AMZN", "META",
         "GOOGL", "GOOG", "AVGO", "TSLA", "COST",
         "NFLX", "AMD", "PEP", "ADBE", "CSCO",
@@ -166,10 +255,6 @@ def get_nasdaq_symbols():
         "AMGN", "ISRG", "BKNG", "HON", "AMAT",
         "VRTX", "PANW", "ADP", "GILD", "SBUX"
     ]
-
-    logger.warning("Using fallback Nasdaq symbols list")
-
-    return fallback_symbols
 
 
 # =========================
@@ -179,30 +264,27 @@ def get_nasdaq_symbols():
 def calculate_rsi(series, period=14):
 
     delta = series.diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    average_gain = gain.ewm(
+    avg_gain = gain.ewm(
         alpha=1 / period,
         min_periods=period,
         adjust=False
     ).mean()
 
-    average_loss = loss.ewm(
+    avg_loss = loss.ewm(
         alpha=1 / period,
         min_periods=period,
         adjust=False
     ).mean()
 
-    rs = average_gain / average_loss.replace(0, float("nan"))
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
 
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi.fillna(100)
+    return (100 - (100 / (1 + rs))).fillna(100)
 
 
-def normalize_yfinance_data(df):
+def normalize_data(df):
 
     if df is None or df.empty:
         return None
@@ -212,42 +294,37 @@ def normalize_yfinance_data(df):
 
     required = ["Close", "High", "Volume"]
 
-    for column in required:
-        if column not in df.columns:
-            return None
+    if not all(col in df.columns for col in required):
+        return None
 
     return df.dropna(subset=["Close", "High"])
 
 
 def get_completed_data(df):
 
-    """
-    أثناء ساعات التداول الأمريكية، نتجنب استخدام شمعة اليوم
-    غير المكتملة إذا كانت موجودة.
-    """
-
     try:
-        now_ny = datetime.now(ZoneInfo("America/New_York"))
+        now = datetime.now(ZoneInfo("America/New_York"))
 
-        if now_ny.weekday() < 5:
-            if (
-                now_ny.hour > 9
-                or (now_ny.hour == 9 and now_ny.minute >= 30)
-            ) and now_ny.hour < 16:
+        if now.weekday() < 5:
+            market_open = (
+                now.hour > 9
+                or (now.hour == 9 and now.minute >= 30)
+            )
 
+            if market_open and now.hour < 16:
                 last_date = pd.Timestamp(df.index[-1]).date()
 
-                if last_date == now_ny.date() and len(df) > 60:
+                if last_date == now.date() and len(df) > 60:
                     return df.iloc[:-1]
 
     except Exception as error:
-        logger.warning("Completed candle check: %s", error)
+        logger.warning("Candle check: %s", error)
 
     return df
 
 
 # =========================
-# تحليل السهم ونظام النقاط V4
+# تحليل السهم V4
 # =========================
 
 def analyze_stock(symbol):
@@ -262,14 +339,14 @@ def analyze_stock(symbol):
             threads=False
         )
 
-        df = normalize_yfinance_data(df)
+        df = normalize_data(df)
 
         if df is None or len(df) < 60:
             return None
 
         df = get_completed_data(df)
 
-        if df is None or len(df) < 60:
+        if len(df) < 60:
             return None
 
         close = df["Close"].astype(float)
@@ -279,61 +356,53 @@ def analyze_stock(symbol):
         ema20 = close.ewm(span=20, adjust=False).mean()
         ema50 = close.ewm(span=50, adjust=False).mean()
 
-        rsi_series = calculate_rsi(close)
+        rsi = calculate_rsi(close)
 
-        macd_line = (
+        macd = (
             close.ewm(span=12, adjust=False).mean()
             - close.ewm(span=26, adjust=False).mean()
         )
 
-        signal_line = macd_line.ewm(
+        signal_line = macd.ewm(
             span=9,
             adjust=False
         ).mean()
 
         price = float(close.iloc[-1])
-        current_ema20 = float(ema20.iloc[-1])
-        current_ema50 = float(ema50.iloc[-1])
-        current_rsi = float(rsi_series.iloc[-1])
+        e20 = float(ema20.iloc[-1])
+        e50 = float(ema50.iloc[-1])
+        current_rsi = float(rsi.iloc[-1])
 
-        current_macd = float(macd_line.iloc[-1])
+        current_macd = float(macd.iloc[-1])
         current_signal = float(signal_line.iloc[-1])
 
+        average_volume = float(volume.iloc[-21:-1].mean())
         current_volume = float(volume.iloc[-1])
 
-        average_volume = float(
-            volume.iloc[-21:-1].mean()
+        volume_ratio = (
+            current_volume / average_volume
+            if average_volume > 0 else 0
         )
 
-        if average_volume <= 0:
-            volume_ratio = 0
-        else:
-            volume_ratio = current_volume / average_volume
-
-        # المقاومة: أعلى سعر خلال آخر 20 جلسة
-        # باستثناء الجلسة الحالية
-
-        resistance = float(
-            high.iloc[-21:-1].max()
-        )
+        resistance = float(high.iloc[-21:-1].max())
 
         score = 0
         details = {}
 
-        # 1) الاتجاه العام - 25 نقطة
+        # الاتجاه
 
-        if price > current_ema20 and current_ema20 > current_ema50:
+        if price > e20 and e20 > e50:
             score += 25
             details["trend"] = 25
 
-        elif price > current_ema20 and price > current_ema50:
+        elif price > e20 and price > e50:
             score += 15
             details["trend"] = 15
 
         else:
             details["trend"] = 0
 
-        # 2) MACD - 20 نقطة
+        # MACD
 
         if current_macd > current_signal:
             score += 20
@@ -341,7 +410,7 @@ def analyze_stock(symbol):
         else:
             details["macd"] = 0
 
-        # 3) RSI - 15 نقطة
+        # RSI
 
         if 50 <= current_rsi <= 68:
             score += 15
@@ -354,9 +423,9 @@ def analyze_stock(symbol):
         else:
             details["rsi"] = 0
 
-        # 4) حجم التداول - 20 نقطة
+        # Volume
 
-        if volume_ratio >= 1.0:
+        if volume_ratio >= 1:
             score += 20
             details["volume"] = 20
 
@@ -367,7 +436,7 @@ def analyze_stock(symbol):
         else:
             details["volume"] = 0
 
-        # 5) الاختراق - 20 نقطة
+        # Breakout
 
         if price > resistance:
             score += 20
@@ -379,8 +448,6 @@ def analyze_stock(symbol):
 
         else:
             details["breakout"] = 0
-
-        # تصنيف التوصية
 
         if score >= 80:
             signal = "STRONG BUY"
@@ -397,33 +464,25 @@ def analyze_stock(symbol):
             "score": score,
             "signal": signal,
             "rsi": current_rsi,
-            "ema20": current_ema20,
-            "ema50": current_ema50,
+            "ema20": e20,
+            "ema50": e50,
             "macd": current_macd,
             "macd_signal": current_signal,
-            "volume": current_volume,
-            "average_volume": average_volume,
             "volume_ratio": volume_ratio,
             "resistance": resistance,
             "details": details
         }
 
     except Exception as error:
-        logger.error(
-            "Analysis error for %s: %s",
-            symbol,
-            error
-        )
+        logger.error("Analysis error %s: %s", symbol, error)
         return None
 
 
 # =========================
-# إدارة الصفقات المفتوحة
+# إدارة الصفقات
 # =========================
 
 def check_open_positions(analysis_results):
-
-    global positions
 
     sell_messages = []
 
@@ -453,26 +512,23 @@ def check_open_positions(analysis_results):
             reason = "Price below EMA20"
 
         elif result["macd"] < result["macd_signal"]:
-            reason = "MACD bearish crossover"
+            reason = "MACD bearish"
 
         elif result["rsi"] < 40:
             reason = "RSI below 40"
 
         if reason:
 
-            profit_percent = (
-                (price - entry) / entry
-            ) * 100
+            profit = ((price - entry) / entry) * 100
 
-            message = (
+            sell_messages.append(
                 f"🔴 SELL ALERT: {symbol}\n\n"
-                f"سعر الدخول: ${entry:.2f}\n"
-                f"سعر الخروج: ${price:.2f}\n"
-                f"النتيجة: {profit_percent:+.2f}%\n"
+                f"الشرعية: {sharia_label(check_sharia(symbol))}\n"
+                f"الدخول: ${entry:.2f}\n"
+                f"الخروج: ${price:.2f}\n"
+                f"النتيجة: {profit:+.2f}%\n"
                 f"السبب: {reason}"
             )
-
-            sell_messages.append(message)
 
             del positions[symbol]
 
@@ -482,28 +538,22 @@ def check_open_positions(analysis_results):
 
 
 # =========================
-# تنفيذ فحص السوق
+# فحص السوق V5
 # =========================
 
 def scan_market():
 
     if not scan_lock.acquire(blocking=False):
-        return (
-            "⏳ يوجد فحص للسوق قيد التنفيذ. "
-            "انتظر حتى ينتهي ثم حاول مجدداً."
-        )
+        return "⏳ يوجد فحص آخر قيد التنفيذ."
 
     try:
 
         symbols = get_nasdaq_symbols()
 
-        if not symbols:
-            return "❌ تعذر الحصول على قائمة Nasdaq-100."
-
         results = []
         analysis_results = {}
 
-        failed_downloads = 0
+        failed = 0
 
         diagnostics = {
             "trend": 0,
@@ -518,148 +568,183 @@ def scan_market():
             result = analyze_stock(symbol)
 
             if result is None:
-                failed_downloads += 1
+                failed += 1
                 continue
 
             results.append(result)
             analysis_results[symbol] = result
 
-            details = result["details"]
-
             for key in diagnostics:
-                if details.get(key, 0) == 0:
+                if result["details"].get(key, 0) == 0:
                     diagnostics[key] += 1
 
-        # فحص الصفقات المفتوحة أولاً
+        # تنبيهات البيع
 
-        sell_messages = check_open_positions(
-            analysis_results
-        )
+        sell_messages = check_open_positions(analysis_results)
 
         for message in sell_messages:
             broadcast(message)
 
-        strong_buys = [
-            item for item in results
-            if item["signal"] == "STRONG BUY"
+        strong = [
+            x for x in results
+            if x["signal"] == "STRONG BUY"
         ]
 
-        medium_signals = [
-            item for item in results
-            if item["signal"] == "MEDIUM"
+        medium = [
+            x for x in results
+            if x["signal"] == "MEDIUM"
         ]
 
-        strong_buys.sort(
-            key=lambda item: item["score"],
+        candidates = strong + medium
+
+        # فحص الشرعية للمرشحين فقط
+
+        for item in candidates:
+            item["sharia"] = check_sharia(item["symbol"])
+
+        # السماح بالتوصية للأسهم المصنفة شرعية فقط
+
+        eligible_strong = [
+            x for x in strong
+            if x["sharia"] == "HALAL"
+        ]
+
+        eligible_medium = [
+            x for x in medium
+            if x["sharia"] == "HALAL"
+        ]
+
+        excluded_haram = [
+            x for x in candidates
+            if x["sharia"] == "HARAM"
+        ]
+
+        excluded_unknown = [
+            x for x in candidates
+            if x["sharia"] == "UNKNOWN"
+        ]
+
+        eligible_strong.sort(
+            key=lambda x: x["score"],
             reverse=True
         )
 
-        medium_signals.sort(
-            key=lambda item: item["score"],
+        eligible_medium.sort(
+            key=lambda x: x["score"],
             reverse=True
         )
 
-        # تسجيل صفقات Strong BUY الجديدة فقط
+        # تسجيل صفقات الشراء الشرعية فقط
 
-        for item in strong_buys:
+        for item in eligible_strong:
 
             symbol = item["symbol"]
 
             if symbol not in positions:
 
-                entry = item["price"]
+                price = item["price"]
 
                 positions[symbol] = {
-                    "entry": round(entry, 2),
-                    "target": round(entry * 1.10, 2),
-                    "stop": round(entry * 0.95, 2),
-                    "opened_at": datetime.utcnow().isoformat()
+                    "entry": round(price, 2),
+                    "target": round(price * 1.10, 2),
+                    "stop": round(price * 0.95, 2),
+                    "opened_at": datetime.now(
+                        timezone.utc
+                    ).isoformat()
                 }
 
         save_json(POSITIONS_FILE, positions)
 
-        # تقرير الفحص
-
         report = (
-            "📊 Nasdaq-100 Scan Completed V4\n\n"
-            f"🔍 Symbols in list: {len(symbols)}\n"
-            f"✅ Stocks analyzed: {len(results)}\n"
-            f"⚠️ Failed downloads: {failed_downloads}\n\n"
-            f"🟢 Strong BUY: {len(strong_buys)}\n"
-            f"🟡 Medium: {len(medium_signals)}\n"
-            f"🔴 Open positions: {len(positions)}\n\n"
-            "📋 Stocks with zero points in each condition\n"
-            f"📈 Trend: {diagnostics['trend']}\n"
-            f"📉 MACD: {diagnostics['macd']}\n"
-            f"📊 RSI: {diagnostics['rsi']}\n"
-            f"📦 Volume: {diagnostics['volume']}\n"
-            f"🚀 Breakout: {diagnostics['breakout']}\n\n"
-            "ℹ️ Exclusion counts can overlap."
+            "📊 Nasdaq-100 Swing Scanner V5\n\n"
+            f"🔍 Symbols: {len(symbols)}\n"
+            f"✅ Analyzed: {len(results)}\n"
+            f"⚠️ Failed: {failed}\n\n"
+            "📊 Technical Signals\n"
+            f"🟢 Strong BUY: {len(eligible_strong)}\n"
+            f"🟡 Medium: {len(eligible_medium)}\n\n"
+            "🕌 Sharia Screening - AAOIFI\n"
+            f"🟢 Eligible: {len(eligible_strong) + len(eligible_medium)}\n"
+            f"🔴 Excluded (Non-compliant): {len(excluded_haram)}\n"
+            f"🟡 Unknown: {len(excluded_unknown)}\n\n"
+            f"📂 Open positions: {len(positions)}\n\n"
+            "📋 Technical Diagnostics\n"
+            f"Trend: {diagnostics['trend']}\n"
+            f"MACD: {diagnostics['macd']}\n"
+            f"RSI: {diagnostics['rsi']}\n"
+            f"Volume: {diagnostics['volume']}\n"
+            f"Breakout: {diagnostics['breakout']}\n"
         )
-
-        # تفاصيل التوصيات
 
         recommendations = []
 
-        for item in strong_buys[:MAX_ALERTS]:
+        for item in eligible_strong[:MAX_ALERTS]:
 
-            symbol = item["symbol"]
             price = item["price"]
 
-            target = price * 1.10
-            stop = price * 0.95
-
             recommendations.append(
-                "🟢 STRONG BUY: "
-                f"{symbol}\n"
+                f"🟢 STRONG BUY: {item['symbol']}\n"
+                f"🕌 الشرعية: {sharia_label(item['sharia'])}\n"
                 f"السعر: ${price:.2f}\n"
-                f"الهدف: ${target:.2f}\n"
-                f"وقف الخسارة: ${stop:.2f}\n"
+                f"الهدف: ${price * 1.10:.2f}\n"
+                f"وقف الخسارة: ${price * 0.95:.2f}\n"
                 f"النقاط: {item['score']}/100\n"
                 f"RSI: {item['rsi']:.1f}\n"
-                f"حجم التداول: {item['volume_ratio']:.2f}x"
+                f"Volume: {item['volume_ratio']:.2f}x"
             )
 
-        remaining_slots = max(
-            0,
-            MAX_ALERTS - len(recommendations)
-        )
+        remaining = max(0, MAX_ALERTS - len(recommendations))
 
-        for item in medium_signals[:remaining_slots]:
+        for item in eligible_medium[:remaining]:
 
             recommendations.append(
-                "🟡 MEDIUM WATCHLIST: "
-                f"{item['symbol']}\n"
+                f"🟡 MEDIUM: {item['symbol']}\n"
+                f"🕌 الشرعية: {sharia_label(item['sharia'])}\n"
                 f"السعر: ${item['price']:.2f}\n"
                 f"النقاط: {item['score']}/100\n"
                 f"RSI: {item['rsi']:.1f}\n"
-                f"حجم التداول: {item['volume_ratio']:.2f}x\n"
-                "مراقبة السهم قبل الدخول."
+                "مراقبة قبل الدخول."
             )
 
         if recommendations:
             report += "\n\n" + "\n\n".join(recommendations)
+
         else:
             report += (
-                "\n\nNo BUY or MEDIUM opportunities "
-                "matched the scoring strategy."
+                "\n\nلا توجد فرص شراء شرعية مطابقة للشروط حالياً."
             )
 
+        # عرض الأسهم المستبعدة شرعياً
+
+        if excluded_haram:
+            report += "\n\n🔴 أسهم مستبعدة شرعياً:\n"
+
+            for item in excluded_haram[:5]:
+                report += (
+                    f"\n🔴 {item['symbol']}"
+                    f" | {item['score']}/100"
+                    f" | غير شرعي وفق فحص AAOIFI"
+                )
+
+        if excluded_unknown:
+            report += "\n\n🟡 أسهم لم تحسم شرعيتها:\n"
+
+            for item in excluded_unknown[:5]:
+                report += f"\n🟡 {item['symbol']} | غير محسوم"
+
         report += (
-            "\n\n⚠️ التنبيهات إشارات فنية وليست ضماناً للربح. "
-            "تحقق من السهم قبل اتخاذ قرار التداول."
+            "\n\n⚠️ الفحص الشرعي آلي ومبني على بيانات Mizan "
+            "ولا يُعد فتوى شرعية. راجع البيانات والجهة الشرعية "
+            "التي تعتمدها قبل الاستثمار."
         )
 
         return report
 
     except Exception as error:
 
-        logger.exception("Market scan error")
+        logger.exception("Scan error")
 
-        return (
-            "❌ حدث خطأ أثناء فحص السوق.\n"
-            f"التفاصيل: {str(error)[:500]}"
-        )
+        return f"❌ حدث خطأ أثناء فحص السوق: {str(error)[:300]}"
 
     finally:
         scan_lock.release()
@@ -673,39 +758,34 @@ def handle_start(chat_id):
 
     register_chat(chat_id)
 
-    message = (
-        "👋 أهلاً بك في Nasdaq-100 Swing Scanner V4\n\n"
-        "📊 نطاق الفحص: Nasdaq-100\n"
-        "📈 نوع التداول: Swing Trading\n"
-        "🔔 التنبيهات: BUY & SELL\n"
-        "🧮 نظام التقييم: 100 نقطة\n\n"
-        "الأوامر المتاحة:\n"
+    send_message(
+        chat_id,
+        "👋 أهلاً بك في Nasdaq-100 Swing Scanner V5\n\n"
+        "📊 السوق: Nasdaq-100\n"
+        "📈 الاستراتيجية: Swing Trading\n"
+        "🕌 الفحص الشرعي: AAOIFI عبر Mizan\n"
+        "🔔 التنبيهات: BUY & SELL\n\n"
+        "الأوامر:\n"
         "/scan - فحص السوق\n"
-        "/status - حالة البوت والصفقات\n"
-        "/help - المساعدة\n\n"
-        "اضغط /scan لبدء الفحص."
+        "/status - حالة البوت\n"
+        "/help - المساعدة"
     )
-
-    send_message(chat_id, message)
 
 
 def handle_status(chat_id):
 
     message = (
-        "📊 Nasdaq-100 Scanner Status\n\n"
+        "📊 Nasdaq Scanner V5\n\n"
         f"👥 Subscribers: {len(chat_ids)}\n"
-        f"🔴 Open positions: {len(positions)}\n"
-        f"⚙️ Strategy: Swing Trading\n"
-        f"🧮 Scoring: V4 / 100\n"
-        f"🔔 Alerts: BUY & SELL"
+        f"📂 Open positions: {len(positions)}\n"
+        f"🕌 Sharia standard: AAOIFI\n"
+        f"📊 Cached Sharia results: {len(sharia_cache)}\n"
     )
 
     if positions:
-
-        message += "\n\n📂 Open Positions:\n"
+        message += "\nOpen positions:\n"
 
         for symbol, position in positions.items():
-
             message += (
                 f"\n{symbol}"
                 f" | Entry: ${float(position['entry']):.2f}"
@@ -717,7 +797,6 @@ def handle_status(chat_id):
 
 
 def run_scan_and_send():
-
     report = scan_market()
     broadcast(report)
 
@@ -727,37 +806,30 @@ def handle_scan(chat_id):
     register_chat(chat_id)
 
     if scan_lock.locked():
-
-        send_message(
-            chat_id,
-            "⏳ يوجد فحص للسوق قيد التنفيذ. انتظر قليلاً."
-        )
+        send_message(chat_id, "⏳ الفحص قيد التنفيذ.")
         return
 
     send_message(
         chat_id,
-        "🔎 بدأ فحص Nasdaq-100 V4، انتظر النتائج..."
+        "🔎 بدأ فحص Nasdaq-100 V5.\n"
+        "سيتم فحص المؤشرات والشرعية، انتظر النتائج..."
     )
 
-    thread = threading.Thread(
+    threading.Thread(
         target=run_scan_and_send,
         daemon=True
-    )
-
-    thread.start()
+    ).start()
 
 
 def handle_update(update):
 
     try:
-
         message = update.get("message")
 
         if not message:
             return
 
         chat_id = message["chat"]["id"]
-
         text = message.get("text", "").strip()
 
         if not text:
@@ -778,31 +850,28 @@ def handle_update(update):
         elif command == "/help":
             send_message(
                 chat_id,
-                "الأوامر المتاحة:\n\n"
                 "/start - تشغيل البوت\n"
-                "/scan - فحص Nasdaq-100\n"
-                "/status - حالة البوت والصفقات"
+                "/scan - فحص السوق\n"
+                "/status - حالة البوت"
             )
 
     except Exception as error:
-        logger.exception("Update handling error: %s", error)
+        logger.exception("Update error: %s", error)
 
 
 # =========================
-# Flask Webhook
+# Flask
 # =========================
 
 @app.route("/", methods=["GET"])
 def home():
-
-    return "Nasdaq-100 Swing Scanner V4 is running."
+    return "Nasdaq-100 Swing Scanner V5 is running."
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
 
     try:
-
         update = request.get_json(silent=True)
 
         if update:
@@ -811,47 +880,33 @@ def webhook():
         return "OK", 200
 
     except Exception as error:
-
         logger.exception("Webhook error: %s", error)
-
         return "ERROR", 500
 
 
 # =========================
-# إعداد Telegram Webhook
+# Webhook setup
 # =========================
 
 def setup_webhook():
 
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN is missing")
+    if not TELEGRAM_TOKEN or not RENDER_EXTERNAL_URL:
+        logger.error("Missing Telegram or Render environment variable")
         return
-
-    if not RENDER_EXTERNAL_URL:
-        logger.error("RENDER_EXTERNAL_URL is missing")
-        return
-
-    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
 
     try:
-
         response = requests.post(
             f"{TELEGRAM_API}/setWebhook",
-            json={"url": webhook_url},
+            json={
+                "url": f"{RENDER_EXTERNAL_URL}/webhook"
+            },
             timeout=20
         )
 
-        logger.info(
-            "Webhook setup response: %s",
-            response.text
-        )
+        logger.info("Webhook response: %s", response.text)
 
     except Exception as error:
-
-        logger.error(
-            "Webhook setup failed: %s",
-            error
-        )
+        logger.error("Webhook setup error: %s", error)
 
 
 setup_webhook()
