@@ -1,5 +1,6 @@
 import os
 import json
+import html
 import logging
 import threading
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 CHAT_FILE = "chats.json"
 POSITIONS_FILE = "positions.json"
 SHARIA_CACHE_FILE = "sharia_cache.json"
+WATCHLIST_FILE = "watchlist.json"
 
 MIZAN_URL = "https://askmizan.com/api/v1/screen/{}"
 
@@ -33,6 +35,8 @@ scan_lock = threading.Lock()
 chat_ids = []
 positions = {}
 sharia_cache = {}
+watchlists = {}
+latest_results = {}
 
 
 # =========================
@@ -58,33 +62,62 @@ def save_json(filename, data):
 chat_ids = load_json(CHAT_FILE, [])
 positions = load_json(POSITIONS_FILE, {})
 sharia_cache = load_json(SHARIA_CACHE_FILE, {})
+watchlists = load_json(WATCHLIST_FILE, {})
 
 
 # =========================
-# Telegram
+# Telegram API
 # =========================
 
-def send_message(chat_id, message):
+def telegram_request(method, payload):
     if not TELEGRAM_TOKEN:
         logger.error("Missing TELEGRAM_BOT_TOKEN")
-        return
+        return None
 
     try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": message
-            },
-            timeout=20
+        response = requests.post(
+            f"{TELEGRAM_API}/{method}",
+            json=payload,
+            timeout=25
         )
+        response.raise_for_status()
+        data = response.json()
+
+        if not data.get("ok"):
+            logger.error("Telegram API error: %s", data)
+
+        return data
+
     except Exception as error:
-        logger.error("Telegram error: %s", error)
+        logger.error("Telegram request error: %s", error)
+        return None
 
 
-def broadcast(message):
-    for chat_id in list(chat_ids):
-        send_message(chat_id, message)
+def send_message(chat_id, message, reply_markup=None, parse_mode=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "disable_web_page_preview": True
+    }
+
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    return telegram_request("sendMessage", payload)
+
+
+def answer_callback(callback_id, text=""):
+    telegram_request(
+        "answerCallbackQuery",
+        {
+            "callback_query_id": callback_id,
+            "text": text,
+            "show_alert": False
+        }
+    )
 
 
 def register_chat(chat_id):
@@ -95,18 +128,40 @@ def register_chat(chat_id):
         save_json(CHAT_FILE, chat_ids)
 
 
+def broadcast(message):
+    for chat_id in list(chat_ids):
+        send_message(chat_id, message)
+
+
 # =========================
-# فحص شرعية السهم - Mizan
+# قائمة المراقبة
+# =========================
+
+def get_watchlist(chat_id):
+    return watchlists.get(str(chat_id), [])
+
+
+def add_to_watchlist(chat_id, symbol):
+    chat_id = str(chat_id)
+
+    if chat_id not in watchlists:
+        watchlists[chat_id] = []
+
+    if symbol not in watchlists[chat_id]:
+        watchlists[chat_id].append(symbol)
+        save_json(WATCHLIST_FILE, watchlists)
+        return True
+
+    return False
+
+
+# =========================
+# فحص الشرعية - Mizan
 # =========================
 
 def check_sharia(symbol):
-    """
-    يعتمد على نتيجة AAOIFI فقط.
-    إذا لم تتوفر نتيجة واضحة يرجع UNKNOWN.
-    """
 
     now = datetime.now(timezone.utc).timestamp()
-
     cached = sharia_cache.get(symbol)
 
     if cached:
@@ -135,41 +190,40 @@ def check_sharia(symbol):
         data = response.json()
 
         status = None
-
-        # الطريقة الأولى: البحث داخل screens
-
         screens = data.get("screens", [])
 
-        for screen in screens:
-            standard = str(
-                screen.get("standard", "")
-            ).upper()
+        if isinstance(screens, list):
+            for screen in screens:
+                if not isinstance(screen, dict):
+                    continue
 
-            if standard == "AAOIFI":
-                compliant = screen.get("compliant")
+                standard = str(
+                    screen.get("standard", "")
+                ).upper()
 
-                if compliant is True:
-                    status = "HALAL"
-                elif compliant is False:
-                    status = "HARAM"
+                if standard == "AAOIFI":
+                    compliant = screen.get("compliant")
 
-                break
+                    if compliant is True:
+                        status = "HALAL"
+                    elif compliant is False:
+                        status = "HARAM"
 
-        # الطريقة الثانية: by_standard
+                    break
 
         if status is None:
             by_standard = data.get("by_standard", {})
-            result = str(
-                by_standard.get("AAOIFI", "")
-            ).lower()
 
-            if result in ("pass", "compliant"):
-                status = "HALAL"
+            if isinstance(by_standard, dict):
+                result = str(
+                    by_standard.get("AAOIFI", "")
+                ).lower()
 
-            elif result in ("fail", "non-compliant"):
-                status = "HARAM"
+                if result in ("pass", "compliant"):
+                    status = "HALAL"
 
-        # لا نعتمد على التخمين
+                elif result in ("fail", "non-compliant"):
+                    status = "HARAM"
 
         if status not in ("HALAL", "HARAM"):
             return "UNKNOWN"
@@ -324,7 +378,48 @@ def get_completed_data(df):
 
 
 # =========================
-# تحليل السهم V4
+# تصنيف RSI - V6
+# =========================
+
+def classify_rsi(value):
+
+    if value < 50:
+        return {
+            "status": "WEAK",
+            "label": "🟡 زخم ضعيف - انتظار تحسن RSI",
+            "entry_allowed": False
+        }
+
+    if value <= 68:
+        return {
+            "status": "READY",
+            "label": "🟢 منطقة دخول مناسبة",
+            "entry_allowed": True
+        }
+
+    if value < 70:
+        return {
+            "status": "CAUTION",
+            "label": "🟡 دخول بحذر - زخم مرتفع",
+            "entry_allowed": True
+        }
+
+    if value <= 75:
+        return {
+            "status": "WAIT",
+            "label": "🟠 انتظار التراجع قبل الدخول",
+            "entry_allowed": False
+        }
+
+    return {
+        "status": "BLOCK",
+        "label": "🔴 تشبع شرائي مرتفع - لا دخول جديد",
+        "entry_allowed": False
+    }
+
+
+# =========================
+# تحليل السهم V6
 # =========================
 
 def analyze_stock(symbol):
@@ -416,7 +511,10 @@ def analyze_stock(symbol):
             score += 15
             details["rsi"] = 15
 
-        elif 45 <= current_rsi < 50 or 68 < current_rsi <= 72:
+        elif (
+            45 <= current_rsi < 50
+            or 68 < current_rsi <= 72
+        ):
             score += 8
             details["rsi"] = 8
 
@@ -458,12 +556,17 @@ def analyze_stock(symbol):
         else:
             signal = "NO SIGNAL"
 
+        rsi_info = classify_rsi(current_rsi)
+
         return {
             "symbol": symbol,
             "price": price,
             "score": score,
             "signal": signal,
             "rsi": current_rsi,
+            "rsi_status": rsi_info["status"],
+            "rsi_label": rsi_info["label"],
+            "entry_allowed": rsi_info["entry_allowed"],
             "ema20": e20,
             "ema50": e50,
             "macd": current_macd,
@@ -476,6 +579,204 @@ def analyze_stock(symbol):
     except Exception as error:
         logger.error("Analysis error %s: %s", symbol, error)
         return None
+
+
+# =========================
+# أزرار التوصيات
+# =========================
+
+def recommendation_keyboard(symbol):
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "📊 تفاصيل السهم",
+                    "callback_data": f"details:{symbol}"
+                },
+                {
+                    "text": "📈 الرسم البياني",
+                    "url": (
+                        "https://www.tradingview.com/symbols/"
+                        f"{symbol}/"
+                    )
+                }
+            ],
+            [
+                {
+                    "text": "⭐ إضافة للمراقبة",
+                    "callback_data": f"watch:{symbol}"
+                }
+            ]
+        ]
+    }
+
+
+def send_recommendation_card(chat_id, item):
+
+    symbol = item["symbol"]
+    price = item["price"]
+    rsi_status = item["rsi_status"]
+
+    if item["signal"] == "STRONG BUY":
+        if rsi_status == "READY":
+            title = "🟢 STRONG BUY - دخول مسموح"
+        elif rsi_status == "CAUTION":
+            title = "🟡 STRONG BUY - دخول بحذر"
+        elif rsi_status == "WAIT":
+            title = "🟠 STRONG BUY - انتظار التراجع"
+        elif rsi_status == "BLOCK":
+            title = "🔴 STRONG BUY - لا دخول حالياً"
+        else:
+            title = "🟡 STRONG BUY - زخم ضعيف"
+
+    else:
+        title = "🟡 MEDIUM - سهم للمراقبة"
+
+    if item["entry_allowed"]:
+        decision = "مسموح فنياً وفق فلتر RSI"
+    else:
+        decision = "انتظار - لا تسجل صفقة جديدة"
+
+    message = (
+        f"<b>{html.escape(title)}</b>\n"
+        f"<b>{html.escape(symbol)}</b> | Nasdaq-100\n"
+        "━━━━━━━━━━━━━━\n"
+        f"💵 <b>السعر:</b> ${price:.2f}\n"
+        f"🎯 <b>الهدف النظري:</b> ${price * 1.10:.2f}\n"
+        f"🛑 <b>وقف الخسارة النظري:</b> ${price * 0.95:.2f}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📊 <b>قوة الإشارة:</b> {item['score']}/100\n"
+        f"📈 <b>RSI:</b> {item['rsi']:.1f}\n"
+        f"📦 <b>Volume:</b> {item['volume_ratio']:.2f}x\n"
+        f"🕌 <b>AAOIFI:</b> {sharia_label(item['sharia'])}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📌 <b>قرار RSI:</b> {html.escape(item['rsi_label'])}\n"
+        f"🔎 <b>حالة الدخول:</b> {decision}\n"
+        "\n<i>الهدف والوقف مستويات نظرية وليسا ضماناً للنتيجة.</i>"
+    )
+
+    send_message(
+        chat_id,
+        message,
+        reply_markup=recommendation_keyboard(symbol),
+        parse_mode="HTML"
+    )
+
+
+# =========================
+# تفاصيل السهم
+# =========================
+
+def send_stock_details(chat_id, symbol):
+
+    result = latest_results.get(symbol)
+
+    if result is None:
+        result = analyze_stock(symbol)
+
+    if result is None:
+        send_message(
+            chat_id,
+            f"تعذر جلب بيانات {symbol} حالياً. حاول لاحقاً."
+        )
+        return
+
+    sharia = result.get("sharia")
+
+    if sharia is None:
+        sharia = check_sharia(symbol)
+
+    message = (
+        f"📊 <b>تفاصيل {html.escape(symbol)}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"💵 السعر: ${result['price']:.2f}\n"
+        f"📈 RSI: {result['rsi']:.1f}\n"
+        f"📊 التقييم: {result['score']}/100\n"
+        f"📉 EMA20: ${result['ema20']:.2f}\n"
+        f"📉 EMA50: ${result['ema50']:.2f}\n"
+        f"📈 MACD: {result['macd']:.4f}\n"
+        f"📈 MACD Signal: {result['macd_signal']:.4f}\n"
+        f"📦 Volume: {result['volume_ratio']:.2f}x\n"
+        f"🚧 المقاومة: ${result['resistance']:.2f}\n"
+        f"🕌 الشرعية: {sharia_label(sharia)}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📌 {html.escape(result['rsi_label'])}"
+    )
+
+    send_message(chat_id, message, parse_mode="HTML")
+
+
+# =========================
+# معالجة أزرار Telegram
+# =========================
+
+def handle_callback(callback):
+
+    callback_id = callback.get("id")
+    data = callback.get("data", "")
+    message = callback.get("message", {})
+
+    chat_id = message.get("chat", {}).get("id")
+
+    if not callback_id or not chat_id:
+        return
+
+    parts = data.split(":", 1)
+
+    if len(parts) != 2:
+        answer_callback(callback_id, "طلب غير معروف")
+        return
+
+    action, symbol = parts
+    symbol = symbol.upper()
+
+    if action == "details":
+
+        answer_callback(callback_id, "جاري جلب التفاصيل...")
+        send_stock_details(chat_id, symbol)
+
+    elif action == "watch":
+
+        added = add_to_watchlist(chat_id, symbol)
+
+        if added:
+            answer_callback(
+                callback_id,
+                f"تمت إضافة {symbol} للمراقبة ⭐"
+            )
+        else:
+            answer_callback(
+                callback_id,
+                f"{symbol} موجود مسبقاً في قائمتك"
+            )
+
+    else:
+        answer_callback(callback_id, "طلب غير معروف")
+
+
+# =========================
+# عرض قائمة المراقبة
+# =========================
+
+def send_watchlist(chat_id):
+
+    items = get_watchlist(chat_id)
+
+    if not items:
+        send_message(
+            chat_id,
+            "⭐ قائمة المراقبة فارغة حالياً.\n"
+            "استخدم زر إضافة للمراقبة أسفل أي توصية."
+        )
+        return
+
+    message = "⭐ <b>قائمة الأسهم للمراقبة</b>\n\n"
+
+    for symbol in items:
+        message += f"• {html.escape(symbol)}\n"
+
+    send_message(chat_id, message, parse_mode="HTML")
 
 
 # =========================
@@ -538,10 +839,26 @@ def check_open_positions(analysis_results):
 
 
 # =========================
-# فحص السوق V5
+# إرسال نتائج الفحص
+# =========================
+
+def send_scan_results(report, recommendations):
+
+    for chat_id in list(chat_ids):
+
+        send_message(chat_id, report)
+
+        for item in recommendations:
+            send_recommendation_card(chat_id, item)
+
+
+# =========================
+# فحص السوق V6
 # =========================
 
 def scan_market():
+
+    global latest_results
 
     if not scan_lock.acquire(blocking=False):
         return "⏳ يوجد فحص آخر قيد التنفيذ."
@@ -578,6 +895,8 @@ def scan_market():
                 if result["details"].get(key, 0) == 0:
                     diagnostics[key] += 1
 
+        latest_results = analysis_results.copy()
+
         # تنبيهات البيع
 
         sell_messages = check_open_positions(analysis_results)
@@ -601,8 +920,6 @@ def scan_market():
 
         for item in candidates:
             item["sharia"] = check_sharia(item["symbol"])
-
-        # السماح بالتوصية للأسهم المصنفة شرعية فقط
 
         eligible_strong = [
             x for x in strong
@@ -634,13 +951,31 @@ def scan_market():
             reverse=True
         )
 
-        # تسجيل صفقات الشراء الشرعية فقط
+        entry_ready = [
+            x for x in eligible_strong
+            if x["entry_allowed"]
+        ]
+
+        waiting = [
+            x for x in eligible_strong + eligible_medium
+            if not x["entry_allowed"]
+        ]
+
+        caution = [
+            x for x in eligible_strong + eligible_medium
+            if x["rsi_status"] == "CAUTION"
+        ]
+
+        # تسجيل الصفقات الافتراضية المسموح بها فقط
 
         for item in eligible_strong:
 
             symbol = item["symbol"]
 
-            if symbol not in positions:
+            if (
+                item["entry_allowed"]
+                and symbol not in positions
+            ):
 
                 price = item["price"]
 
@@ -656,18 +991,27 @@ def scan_market():
         save_json(POSITIONS_FILE, positions)
 
         report = (
-            "📊 Nasdaq-100 Swing Scanner V5\n\n"
+            "📊 Nasdaq-100 Swing Scanner V6\n\n"
             f"🔍 Symbols: {len(symbols)}\n"
             f"✅ Analyzed: {len(results)}\n"
             f"⚠️ Failed: {failed}\n\n"
+
             "📊 Technical Signals\n"
             f"🟢 Strong BUY: {len(eligible_strong)}\n"
             f"🟡 Medium: {len(eligible_medium)}\n\n"
+
+            "🎯 RSI Entry Filter\n"
+            f"🟢 Entry Ready: {len(entry_ready)}\n"
+            f"🟡 Caution: {len(caution)}\n"
+            f"🟠 Waiting / No Entry: {len(waiting)}\n\n"
+
             "🕌 Sharia Screening - AAOIFI\n"
             f"🟢 Eligible: {len(eligible_strong) + len(eligible_medium)}\n"
-            f"🔴 Excluded (Non-compliant): {len(excluded_haram)}\n"
+            f"🔴 Excluded: {len(excluded_haram)}\n"
             f"🟡 Unknown: {len(excluded_unknown)}\n\n"
+
             f"📂 Open positions: {len(positions)}\n\n"
+
             "📋 Technical Diagnostics\n"
             f"Trend: {diagnostics['trend']}\n"
             f"MACD: {diagnostics['macd']}\n"
@@ -676,45 +1020,24 @@ def scan_market():
             f"Breakout: {diagnostics['breakout']}\n"
         )
 
-        recommendations = []
+        # تجهيز البطاقات
 
-        for item in eligible_strong[:MAX_ALERTS]:
+        all_eligible = eligible_strong + eligible_medium
 
-            price = item["price"]
+        all_eligible.sort(
+            key=lambda x: (
+                x["score"],
+                x["entry_allowed"]
+            ),
+            reverse=True
+        )
 
-            recommendations.append(
-                f"🟢 STRONG BUY: {item['symbol']}\n"
-                f"🕌 الشرعية: {sharia_label(item['sharia'])}\n"
-                f"السعر: ${price:.2f}\n"
-                f"الهدف: ${price * 1.10:.2f}\n"
-                f"وقف الخسارة: ${price * 0.95:.2f}\n"
-                f"النقاط: {item['score']}/100\n"
-                f"RSI: {item['rsi']:.1f}\n"
-                f"Volume: {item['volume_ratio']:.2f}x"
-            )
+        recommendations = all_eligible[:MAX_ALERTS]
 
-        remaining = max(0, MAX_ALERTS - len(recommendations))
-
-        for item in eligible_medium[:remaining]:
-
-            recommendations.append(
-                f"🟡 MEDIUM: {item['symbol']}\n"
-                f"🕌 الشرعية: {sharia_label(item['sharia'])}\n"
-                f"السعر: ${item['price']:.2f}\n"
-                f"النقاط: {item['score']}/100\n"
-                f"RSI: {item['rsi']:.1f}\n"
-                "مراقبة قبل الدخول."
-            )
-
-        if recommendations:
-            report += "\n\n" + "\n\n".join(recommendations)
-
-        else:
+        if not recommendations:
             report += (
                 "\n\nلا توجد فرص شراء شرعية مطابقة للشروط حالياً."
             )
-
-        # عرض الأسهم المستبعدة شرعياً
 
         if excluded_haram:
             report += "\n\n🔴 أسهم مستبعدة شرعياً:\n"
@@ -733,18 +1056,23 @@ def scan_market():
                 report += f"\n🟡 {item['symbol']} | غير محسوم"
 
         report += (
+            "\n\nℹ️ إشارات البوت فنية وليست ضماناً للربح."
+            "\nالصفقات المسجلة افتراضية للمتابعة وليست "
+            "عمليات شراء فعلية في حساب الوساطة."
             "\n\n⚠️ الفحص الشرعي آلي ومبني على بيانات Mizan "
-            "ولا يُعد فتوى شرعية. راجع البيانات والجهة الشرعية "
-            "التي تعتمدها قبل الاستثمار."
+            "ولا يُعد فتوى شرعية."
         )
 
-        return report
+        return report, recommendations
 
     except Exception as error:
 
         logger.exception("Scan error")
 
-        return f"❌ حدث خطأ أثناء فحص السوق: {str(error)[:300]}"
+        return (
+            f"❌ حدث خطأ أثناء فحص السوق: {str(error)[:300]}",
+            []
+        )
 
     finally:
         scan_lock.release()
@@ -760,14 +1088,16 @@ def handle_start(chat_id):
 
     send_message(
         chat_id,
-        "👋 أهلاً بك في Nasdaq-100 Swing Scanner V5\n\n"
+        "👋 أهلاً بك في Nasdaq-100 Swing Scanner V6\n\n"
         "📊 السوق: Nasdaq-100\n"
         "📈 الاستراتيجية: Swing Trading\n"
         "🕌 الفحص الشرعي: AAOIFI عبر Mizan\n"
+        "🎯 فلتر RSI: V6\n"
         "🔔 التنبيهات: BUY & SELL\n\n"
         "الأوامر:\n"
         "/scan - فحص السوق\n"
         "/status - حالة البوت\n"
+        "/watchlist - قائمة المراقبة\n"
         "/help - المساعدة"
     )
 
@@ -775,11 +1105,12 @@ def handle_start(chat_id):
 def handle_status(chat_id):
 
     message = (
-        "📊 Nasdaq Scanner V5\n\n"
+        "📊 Nasdaq Scanner V6\n\n"
         f"👥 Subscribers: {len(chat_ids)}\n"
         f"📂 Open positions: {len(positions)}\n"
         f"🕌 Sharia standard: AAOIFI\n"
         f"📊 Cached Sharia results: {len(sharia_cache)}\n"
+        f"⭐ Watchlist: {len(get_watchlist(chat_id))}\n"
     )
 
     if positions:
@@ -797,8 +1128,8 @@ def handle_status(chat_id):
 
 
 def run_scan_and_send():
-    report = scan_market()
-    broadcast(report)
+    report, recommendations = scan_market()
+    send_scan_results(report, recommendations)
 
 
 def handle_scan(chat_id):
@@ -811,8 +1142,9 @@ def handle_scan(chat_id):
 
     send_message(
         chat_id,
-        "🔎 بدأ فحص Nasdaq-100 V5.\n"
-        "سيتم فحص المؤشرات والشرعية، انتظر النتائج..."
+        "🔎 بدأ فحص Nasdaq-100 V6.\n"
+        "سيتم فحص المؤشرات وRSI والشرعية.\n"
+        "ستصلك النتائج على شكل بطاقات تفاعلية."
     )
 
     threading.Thread(
@@ -824,6 +1156,15 @@ def handle_scan(chat_id):
 def handle_update(update):
 
     try:
+
+        # ضغط الأزرار
+
+        callback = update.get("callback_query")
+
+        if callback:
+            handle_callback(callback)
+            return
+
         message = update.get("message")
 
         if not message:
@@ -847,12 +1188,17 @@ def handle_update(update):
             register_chat(chat_id)
             handle_status(chat_id)
 
+        elif command == "/watchlist":
+            register_chat(chat_id)
+            send_watchlist(chat_id)
+
         elif command == "/help":
             send_message(
                 chat_id,
                 "/start - تشغيل البوت\n"
                 "/scan - فحص السوق\n"
-                "/status - حالة البوت"
+                "/status - حالة البوت\n"
+                "/watchlist - قائمة المراقبة"
             )
 
     except Exception as error:
@@ -865,7 +1211,7 @@ def handle_update(update):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Nasdaq-100 Swing Scanner V5 is running."
+    return "Nasdaq-100 Swing Scanner V6 is running."
 
 
 @app.route("/webhook", methods=["POST"])
@@ -898,7 +1244,11 @@ def setup_webhook():
         response = requests.post(
             f"{TELEGRAM_API}/setWebhook",
             json={
-                "url": f"{RENDER_EXTERNAL_URL}/webhook"
+                "url": f"{RENDER_EXTERNAL_URL}/webhook",
+                "allowed_updates": [
+                    "message",
+                    "callback_query"
+                ]
             },
             timeout=20
         )
